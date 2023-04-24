@@ -72,7 +72,7 @@ bool ShouldPersistUDT(const UserDefinedTimestampTestMode& test_mode);
 // "N*compressed_fraction" bytes and return a Slice that references
 // the generated data.
 Slice CompressibleString(Random* rnd, double compressed_fraction, int len,
-                         std::string* dst);
+                         std::string* dst, const std::string& src);
 
 #ifndef NDEBUG
 // An internal comparator that just forward comparing results from the
