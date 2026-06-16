@@ -9,13 +9,21 @@
 
 #include "test_util/testharness.h"
 
+#include <cstdlib>
 #include <regex>
 #include <string>
 #include <thread>
 
+#ifndef OS_WIN
+#include <unistd.h>
+#endif
+
+#ifndef NDEBUG
 #include "test_util/sync_point.h"
+#endif
 
 namespace {
+#ifndef NDEBUG
 // Global gtest event listener that cleans up SyncPoint state after every
 // test. Many tests set SyncPoint callbacks with captured local variables
 // but forget to disable/clear them. Under sharded execution (multiple
@@ -45,6 +53,7 @@ static int RegisterSyncPointCleanup() noexcept {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 [[maybe_unused]] static int sync_point_cleanup_registered_ =
     RegisterSyncPointCleanup();
+#endif  // !NDEBUG
 }  // namespace
 
 namespace ROCKSDB_NAMESPACE::test {
@@ -92,6 +101,25 @@ int RandomSeed() {
     result = 301;
   }
   return result;
+}
+
+bool HasBigMem() {
+  const char* env = getenv("ROCKSDB_BIGMEM_TESTS");
+  if (env != nullptr && env[0] != '\0') {
+    return true;
+  }
+#ifdef _SC_PHYS_PAGES
+  // Check whether the system has at least 128GB of physical RAM.
+  // _SC_PHYS_PAGES is available on Linux and macOS but is not standard POSIX.
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long page_size = sysconf(_SC_PAGE_SIZE);
+  if (pages > 0 && page_size > 0) {
+    size_t total_bytes =
+        static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+    return total_bytes >= size_t{128} << 30;
+  }
+#endif
+  return false;
 }
 
 TestRegex::TestRegex(const std::string& pattern)

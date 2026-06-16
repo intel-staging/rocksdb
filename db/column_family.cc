@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "db/blob/blob_file_cache.h"
+#include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -495,6 +497,15 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
       result.memtable_avg_op_scan_flush_trigger = 0;
     }
   }
+  if (result.enable_blob_direct_write && !result.enable_blob_files) {
+    ROCKS_LOG_WARN(db_options.info_log.get(),
+                   "enable_blob_direct_write requires enable_blob_files=true. "
+                   "Disabling blob direct write.");
+    result.enable_blob_direct_write = false;
+  }
+  if (result.blob_direct_write_partitions == 0) {
+    result.blob_direct_write_partitions = 1;
+  }
   return result;
 }
 
@@ -601,7 +612,7 @@ ColumnFamilyData::ColumnFamilyData(
     const FileOptions* file_options, ColumnFamilySet* column_family_set,
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
-    const std::string& db_session_id, bool read_only)
+    const std::string& db_session_id, bool read_only, bool fast_sst_open)
     : id_(id),
       name_(name),
       dummy_versions_(_dummy_versions),
@@ -661,7 +672,7 @@ ColumnFamilyData::ColumnFamilyData(
         new InternalStats(ioptions_.num_levels, ioptions_.clock, this));
     table_cache_.reset(new TableCache(ioptions_, file_options, _table_cache,
                                       block_cache_tracer, io_tracer,
-                                      db_session_id));
+                                      db_session_id, fast_sst_open));
     blob_file_cache_.reset(
         new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
                           internal_stats_->GetBlobFileReadHist(), io_tracer));
@@ -780,6 +791,11 @@ ColumnFamilyData::~ColumnFamilyData() {
           id_, name_.c_str());
     }
   }
+}
+
+void ColumnFamilyData::SetBlobPartitionManager(
+    std::shared_ptr<BlobFilePartitionManager> mgr) {
+  blob_partition_manager_ = std::move(mgr);
 }
 
 bool ColumnFamilyData::UnrefAndTryDelete() {
@@ -1523,6 +1539,32 @@ Status ColumnFamilyData::ValidateOptions(
 
   const auto* ucmp = cf_options.comparator;
   assert(ucmp);
+  if (cf_options.enable_blob_direct_write) {
+    if (db_options.enable_pipelined_write) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support pipelined writes.");
+    }
+    if (db_options.allow_concurrent_memtable_write) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support concurrent memtable writes.");
+    }
+    if (db_options.unordered_write) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support unordered writes.");
+    }
+    if (db_options.two_write_queues) {
+      return Status::NotSupported(
+          "Blob direct write v1 does not support two write queues.");
+    }
+    if (cf_options.experimental_mempurge_threshold > 0.0) {
+      return Status::NotSupported(
+          "Blob direct write does not support MemPurge.");
+    }
+    if (ucmp->timestamp_size() > 0) {
+      return Status::NotSupported(
+          "Blob direct write does not support user-defined timestamps.");
+    }
+  }
   if (ucmp->timestamp_size() > 0 &&
       !cf_options.persist_user_defined_timestamps) {
     if (db_options.atomic_flush) {
@@ -1561,6 +1603,14 @@ Status ColumnFamilyData::ValidateOptions(
           "The garbage ratio threshold for forcing blob garbage collection "
           "should be in the range [0.0, 1.0].");
     }
+  }
+
+  if (cf_options.read_triggered_compaction_threshold < 0.0 ||
+      std::isnan(cf_options.read_triggered_compaction_threshold) ||
+      std::isinf(cf_options.read_triggered_compaction_threshold)) {
+    return Status::InvalidArgument(
+        "read_triggered_compaction_threshold must be >= 0.0 and finite. "
+        "Use 0.0 to disable.");
   }
 
   if (cf_options.compaction_style == kCompactionStyleFIFO &&
@@ -1759,16 +1809,14 @@ void ColumnFamilyData::RecoverEpochNumbers() {
   vstorage->RecoverEpochNumbers(this);
 }
 
-ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
-                                 const ImmutableDBOptions* db_options,
-                                 const FileOptions& file_options,
-                                 Cache* table_cache,
-                                 WriteBufferManager* _write_buffer_manager,
-                                 WriteController* _write_controller,
-                                 BlockCacheTracer* const block_cache_tracer,
-                                 const std::shared_ptr<IOTracer>& io_tracer,
-                                 const std::string& db_id,
-                                 const std::string& db_session_id)
+ColumnFamilySet::ColumnFamilySet(
+    const std::string& dbname, const ImmutableDBOptions* db_options,
+    const FileOptions& file_options, Cache* table_cache,
+    WriteBufferManager* _write_buffer_manager,
+    WriteController* _write_controller,
+    BlockCacheTracer* const block_cache_tracer,
+    const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
+    const std::string& db_session_id, bool fast_sst_open)
     : max_column_family_(0),
       file_options_(file_options),
       dummy_cfd_(new ColumnFamilyData(
@@ -1785,7 +1833,8 @@ ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
       block_cache_tracer_(block_cache_tracer),
       io_tracer_(io_tracer),
       db_id_(db_id),
-      db_session_id_(db_session_id) {
+      db_session_id_(db_session_id),
+      fast_sst_open_(fast_sst_open) {
   // initialize linked list
   dummy_cfd_->prev_ = dummy_cfd_;
   dummy_cfd_->next_ = dummy_cfd_;
@@ -1852,7 +1901,7 @@ ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
   ColumnFamilyData* new_cfd = new ColumnFamilyData(
       id, name, dummy_versions, table_cache_, write_buffer_manager_, options,
       *db_options_, &file_options_, this, block_cache_tracer_, io_tracer_,
-      db_id_, db_session_id_, read_only);
+      db_id_, db_session_id_, read_only, fast_sst_open_);
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});
   auto ucmp = new_cfd->user_comparator();
